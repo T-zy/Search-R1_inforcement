@@ -1,0 +1,59 @@
+# ============================================================
+# Search Tool Configuration for verl Tool Agent Loop
+# ============================================================
+# This config declares the SearchTool as a native verl BaseTool.
+# It is loaded by verl via:
+#   actor_rollout_ref.rollout.multi_turn.tool_config_path
+#
+# Ensure the retrieval service is running before training:
+#   python recipe/search_r1_verl/retrieval_service/server.py \
+#       --index_path /path/to/e5_IVF4096_Flat.index \
+#       --corpus_path /path/to/wiki-18.jsonl \
+#       --retriever_model intfloat/e5-base-v2
+# ============================================================
+
+tools:
+  - class_name: recipe.search_r1_verl.tools.search_tool.SearchTool
+    config:
+      # Tool type: "native" for BaseTool subclass
+      type: native
+
+      # Local retrieval service endpoint
+      endpoint: http://127.0.0.1:8000/retrieve
+
+      # HTTP request timeout in seconds
+      timeout: 5
+
+      # Default number of passages to retrieve
+      default_topk: 3
+
+      # Maximum allowed topk (safety limit)
+      max_topk: 5
+
+      # Maximum characters per document (to avoid oversized context)
+      max_doc_chars: 1200
+
+      # Maximum total characters for the formatted tool response
+      max_tool_response_chars: 6000
+
+    # OpenAI-compatible tool schema exposed to the LLM
+    tool_schema:
+      type: function
+      function:
+        name: search
+        description: >-
+          Search Wikipedia passages relevant to a factual question.
+          Returns the top-k passages formatted as
+          <information>...</information>.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: The search query string.
+            topk:
+              type: integer
+              description: >-
+                Number of passages to retrieve (1-5). Default is 3.
+          required:
+            - query

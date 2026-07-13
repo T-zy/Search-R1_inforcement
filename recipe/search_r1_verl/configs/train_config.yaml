@@ -1,0 +1,94 @@
+# ============================================================
+# Search-R1 Verl Training Configuration (YAML reference)
+# ============================================================
+# This file documents the recommended configuration for
+# GRPO training with Tool Agent Loop. It can be used with:
+#
+#   python3 -m verl.trainer.main_ppo --config-path .../configs --config-name train_config
+#
+# Or individual parameters can be overridden via CLI as in
+# the shell scripts in the scripts/ directory.
+# ============================================================
+
+defaults:
+  - _self_
+  - algorithm: grpo
+
+data:
+  train_files: /path/to/train.parquet
+  val_files: /path/to/test.parquet
+  return_raw_chat: true
+  truncation: error
+  filter_overlong_prompts: true
+  train_batch_size: 256
+  val_batch_size: 128
+  max_prompt_length: 4096
+  max_response_length: 2048
+  shuffle_train_dataloader: true
+
+actor_rollout_ref:
+  model:
+    path: /path/to/qwen2.5-1.5b-searchr1-sft
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+
+  actor:
+    optim:
+      lr: 1e-6
+      lr_warmup_steps_ratio: 0.08
+    ppo_mini_batch_size: 256
+    ppo_micro_batch_size: 4
+    fsdp_config:
+      param_offload: true
+      grad_offload: true
+      optimizer_offload: true
+
+  rollout:
+    name: vllm
+    mode: async
+    n: 5
+    temperature: 1.0
+    top_p: 1.0
+    gpu_memory_utilization: 0.35
+    log_prob_micro_batch_size: 32
+    tensor_model_parallel_size: 1
+    enable_chunked_prefill: true
+    enable_prefix_caching: true
+
+    # === Multi-turn / Tool Agent Configuration ===
+    multi_turn:
+      enable: true
+      max_user_turns: 3
+      max_assistant_turns: 3
+      max_parallel_calls: 1
+      max_tool_response_length: 2048
+      tool_config_path: /path/to/recipe/search_r1_verl/tools/search_tool_config.yaml
+      format: hermes
+
+    agent:
+      default_agent_loop: tool_agent
+      num_workers: 4
+
+  ref:
+    log_prob_micro_batch_size: 32
+    fsdp_config:
+      param_offload: true
+
+algorithm:
+  adv_estimator: grpo
+  kl_ctrl:
+    kl_coef: 0.001
+  kl_penalty: kl
+
+trainer:
+  project_name: Search-R1-Verl
+  experiment_name: search-r1-grpo-qwen2.5-1.5b-verl-tool-agent
+  logger: ["console", "wandb"]
+  val_before_train: false
+  n_gpus_per_node: 4
+  nnodes: 1
+  save_freq: 100
+  test_freq: 100
+  total_epochs: 15
+  total_training_steps: 1005
+  default_local_dir: /path/to/checkpoints
