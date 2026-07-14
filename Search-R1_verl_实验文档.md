@@ -288,43 +288,84 @@ class LRUCache:
 
 ---
 
-### 3.3 奖励函数
+### 3.3 奖励函数（v2）
 
 **文件**: `recipe/search_r1_verl/rewards/qa_em_tool_reward.py`
 
-#### 与原版的对照
+#### 版本说明
 
-原版位于 `verl/utils/reward_score/qa_em_format.py`，新版**完全复现了原版的奖励逻辑**，但做了以下改进：
+奖励函数经历了一次重大重构（2026-07-14），从 v1 升级到 v2。以下是变更总结：
 
-| 方面 | 原版 | 新版 |
-|------|------|------|
-| 导入方式 | 通过 `_select_rm_score_fn` 函数选择 | 可直接 `from recipe.search_r1_verl.rewards.qa_em_tool_reward import compute_score_em` |
-| 类型注解 | ❌ 无 | ✅ 完整 `str`, `list[str]`, `dict[str, Any]` 注解 |
-| 序列验证 | 松散的状态机（9 种状态转换） | 严格的状态机（11 种状态，覆盖更多边界） |
-| 调试输出 | `random.randint(1, 64) == 1` 随机打印 | 移除了随机打印，奖励函数保持确定性和可复现性 |
-| 代码组织 | 单一文件平铺 | 模块化组织，每个函数有明确 docstring |
+| 维度 | v1（原始版本） | v2（当前版本） |
+|------|---------------|---------------|
+| 函数签名 | `compute_score_em(solution_str, ground_truth, ...)` | `compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs)` |
+| 返回值 | `float` | `dict`（含 `score` + 6 个分项指标） |
+| `<search>` 依赖 | 有（`is_valid_sequence` 强制检查） | 无（改为检测 `<information>` 块） |
+| 奖励矩阵 | 7 种情况 + 3 个可调参数 | 5 组件线性累加 |
+| `extract_solution()` | `<= 1` bug（一个答案时也返回 None） | `< 1` 已修复 |
+| wandb 分项指标 | 无 | 6 个自动注册指标 |
 
-#### 奖励矩阵
+#### 设计原理
 
-| 条件 | 分数 |
-|------|------|
-| 答案正确 + 格式有效 | `score` (1.0) |
-| 答案正确 + 格式无效 | `score - structure_format_score` (0.8) |
-| 无答案 + 格式有效 + 检索包含答案 | `structure_format_score + retrieval_score` (0.3) |
-| 无答案 + 格式有效 + 检索不包含 | `structure_format_score` (0.2) |
-| 答案错误 + 格式有效 + 检索包含答案 | `structure_format_score + retrieval_score` (0.3) |
-| 答案错误 + 格式有效 + 检索不包含 | `structure_format_score` (0.2) |
-| 无答案/答案错误 + 格式无效 | `final_format_score` (0.1) 或 0.0 |
+原版 Search-R1 的奖励函数存在三个关键问题，v2 逐一解决：
 
-#### 序列验证状态机
+1. **函数签名不兼容**：verl 的 `NaiveRewardManager` 调用 `compute_score(data_source, solution_str, ground_truth, extra_info)`，而 v1 使用 `compute_score_em(solution_str, ground_truth, ...)`，**永远不会被调用**。
 
-新版使用 **11 状态** 的严格状态机验证标签顺序：
+2. **`extract_solution()` bug**：`if len(matches) <= 1: return None` 导致恰好有一个 `<answer>` 标签时（正常情况）返回 None，所有正确轨迹的答案都提取不到。
 
+3. **搜索无收益**：搜索后答对 = 1.0 且不搜索答对 = 1.0，模型倾向于不搜索直接猜答案。
+
+#### 奖励矩阵（v2）
+
+采用 5 组件线性累加，范围为 `[-0.2, 1.0]`：
+
+| 条件 | 累加值 |
+|------|--------|
+| 答案正确（EM） | +0.8 |
+| 有 `<answer>` 标签 | +0.1 |
+| 搜索成功（`<information>` 块存在且非失败信息） | +0.05 |
+| 检索证据包含答案 | +0.05 |
+| 多跳数据集（hotpotqa 等）+ 零搜索 | **-0.2** |
+
+```python
+def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    reward = 0.0
+    if answer_correct:
+        reward += 0.8
+    if has_answer:
+        reward += 0.1
+    if search_success:
+        reward += 0.05
+    if retrieval_ok:
+        reward += 0.05
+    if is_multi_hop and num_search_calls == 0:
+        reward -= 0.2
+    reward = max(-0.2, min(1.0, reward))
+    return {
+        "score": float(reward),
+        "answer_em": float(answer_correct),
+        "has_final_answer": float(has_answer),
+        "num_search_calls": float(num_search_calls),
+        "search_success": float(search_success),
+        "retrieval_correct": float(retrieval_ok),
+        "no_search_penalty": float(is_multi_hop and num_search_calls == 0),
+    }
 ```
-start → thinking → after_think → searching → after_search → information → after_info → ... → answering → answered
+
+#### 关键变更：移除 `<search>` 标签依赖
+
+v1 的 `is_valid_sequence()` 强制检查 `<search>` 标签，但 verl Tool Agent Loop 在 `format=hermes` 下使用 OpenAI function call 格式，模型**不会生成** `<search>` 标签。因此 v2 删除了整个 `is_valid_sequence()` 函数，改为从 `<information>` 块检测搜索行为：
+
+```python
+def extract_search_info(solution_str: str) -> tuple[int, bool]:
+    blocks = extract_information_blocks(solution_str)
+    if not blocks:
+        return 0, False
+    success = any("Search failed:" not in b for b in blocks)
+    return len(blocks), success
 ```
 
-比原版的 9 状态更严格地检查标签嵌套和顺序，例如原版允许 `think → answer` 直接跳转，新版要求必须经过 `search → information → think → answer` 的完整路径。
+保留的标签检查：`<think>`（推理过程）、`<information>`（检索结果）、`<answer>`（最终答案）。
 
 ---
 
@@ -475,28 +516,39 @@ reward/max
 #### Smoke Test 配置
 
 ```bash
-# 10 条样本, n=2, max_turns=2, gpu_mem=0.35
+# 10 条样本, n=2, max_turns=2, gpu_mem=0.45, 注册自定义 reward
 python -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
     data.train_batch_size=8 \
+    data.val_batch_size=8 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=512 \
     actor_rollout_ref.rollout.n=2 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.45 \
+    actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=2 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=2 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path=".../tools/search_tool_config.yaml" \
+    actor_rollout_ref.rollout.multi_turn.format=hermes \
+    actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
+    reward.custom_reward_function.path=".../rewards/qa_em_tool_reward.py" \
+    reward.custom_reward_function.name=compute_score \
+    trainer.val_before_train=true \
     trainer.total_training_steps=10
 ```
 
 #### 关键超参数建议
 
-| 参数 | Smoke Test | 正式训练 |
-|------|-----------|----------|
-| `train_batch_size` | 8 | 256 |
-| `rollout.n` | 2 | 5 |
-| `max_prompt_length` | 2048 | 4096 |
-| `max_response_length` | 512 | 2048 |
-| `gpu_memory_utilization` | 0.35 | 0.35~0.45 |
-| `ppo_micro_batch_size` | 2 | 4 |
-| `total_training_steps` | 10 | 1005 |
-| `lr` | 1e-6 | 1e-6 |
+| 参数 | Smoke Test | 第一阶段训练 | 正式训练 |
+|------|-----------|-------------|----------|
+| `train_batch_size` | 8 | 64 | 128~256 |
+| `rollout.n` | 2 | 4 | 4~5 |
+| `max_prompt_length` | 2048 | 4096 | 4096 |
+| `max_response_length` | 512 | 1024 | 2048 |
+| `gpu_memory_utilization` | 0.45 | 0.45 | 0.45~0.55 |
+| `ppo_micro_batch_size` | 2 | 4 | 4~8 |
+| `total_training_steps` | 10 | 150 | 1005 |
+| `lr` | 1e-6 | 5e-7 | 5e-7~1e-6 |
 
 ---
 
@@ -680,9 +732,10 @@ bash /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/scripts/train_grpo_
 **通过标准**：
 - 训练不报错
 - 检索服务无崩溃
+- 自定义 reward 被调用（日志中出现 `Loaded reward function 'compute_score' from ...`）
 - 至少产生有效 tool call
-- 能计算 reward
-- 能输出 trajectory metrics
+- 能计算 reward（wandb 中 `reward/mean > 0`）
+- wandb 中出现分项指标：`reward/answer_em`、`reward/num_search_calls`、`reward/search_success`
 
 ### 5.4 数据准备
 
@@ -700,14 +753,27 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/data/convert_hotp
     --max_samples 10000
 ```
 
-### 5.5 正式训练
+### 5.5 第一阶段训练（150 step）
 
 ```bash
-# 修改 train_grpo_qwen25_1p5b.sh 中的数据路径后执行
+# 默认参数为第一阶段（batch=64, rollout.n=4, steps=150）
+# 确认数据路径后执行
 bash /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/scripts/train_grpo_qwen25_1p5b.sh
 ```
 
-### 5.6 评测
+### 5.6 正式训练（1005 step）
+
+第一阶段验证通过后，修改训练脚本参数再执行：
+
+```bash
+# 在 train_grpo_qwen25_1p5b.sh 中调整：
+# TRAIN_BATCH_SIZE=128
+# TOTAL_STEPS=1005
+# 然后执行
+bash /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/scripts/train_grpo_qwen25_1p5b.sh
+```
+
+### 5.7 评测
 
 ```bash
 # 1. 先生成模型预测结果
@@ -727,15 +793,20 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/evaluation/eval_e
 
 - [ ] 训练脚本运行不报错
 - [ ] 检索服务 `/health` 返回正常
+- [ ] 日志出现 `Loaded reward function 'compute_score' from ...`（自定义 reward 已注册）
 - [ ] 至少产生有效 tool call（wandb 中 `tool/search_called > 0`）
 - [ ] 能计算奖励（wandb 中 `reward/mean > 0`）
+- [ ] wandb 中出现分项指标：`reward/answer_em`、`reward/num_search_calls`、`reward/search_success`
 - [ ] 能输出 trajectory metrics（wandb 中 `trajectory/valid_rate` 存在）
 
-### 6.2 小规模训练通过条件
+### 6.2 第一阶段训练（150 step）通过条件
 
 - [ ] 无 OOM
-- [ ] `trajectory/valid_rate > 70%`
+- [ ] `no_search_ratio` 不快速接近 1
+- [ ] `search_calls_mean` 不快速降到 0
+- [ ] `response_length_mean` 不从几百骤降到几十
 - [ ] `tool/search_success_rate > 95%`
+- [ ] `zero_variance_group_rate` 不长期 > 50%
 - [ ] reward 曲线不全为 0
 - [ ] 能保存 checkpoint
 
@@ -743,7 +814,9 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/evaluation/eval_e
 
 - [ ] EM 指标可复现
 - [ ] valid trajectory rate 稳定
-- [ ] search call rate 合理
+- [ ] HotpotQA 搜索率明显高于 NQ
+- [ ] 搜索后答对率 > 不搜索答对率
+- [ ] reward 与搜索次数不呈强负相关
 - [ ] throughput 达预期
 - [ ] GPU 利用率合理
 - [ ] 检索延迟 p95 稳定
@@ -761,9 +834,9 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/evaluation/eval_e
 | `data.max_obs_length` | `max_tool_response_length` | 工具响应长度 |
 | `actor_rollout_ref.rollout.n_agent` | `actor_rollout_ref.rollout.n` | rollout 采样数 |
 | `actor_rollout_ref.actor.state_masking` | 内置为 response_mask | 新版原生支持 |
-| `reward_model.structure_format_score` | 在自定义 RewardManager 中设置 | 不再通过 CLI 传递 |
-| `reward_model.final_format_score` | 同上 | - |
-| `reward_model.retrieval_score` | 同上 | - |
+| `reward_model.structure_format_score` | `reward.custom_reward_function.path` | 不再通过 CLI 传递，改为注册自定义函数 |
+| `reward_model.final_format_score` | 同上（在 reward 函数内部实现） | - |
+| `reward_model.retrieval_score` | 同上（在 reward 函数内部实现） | - |
 | `max_turns` | `multi_turn.max_user_turns` / `max_assistant_turns` | 新版区分 user 和 assistant |
 | `retriever.url` | `multi_turn.tool_config_path` | 通过 YAML 配置 |
 | `retriever.topk` | 在 SearchTool 的 YAML 配置中 | 通过 YAML 配置 |
@@ -773,22 +846,23 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/evaluation/eval_e
 
 ## 附录 B：与原版 Search-R1 对比总结表
 
-| 特性 | 原版 Search-R1 | 新版 (本实验) | 改进幅度 |
-|------|---------------|--------------|----------|
+| 特性 | 原版 Search-R1 | 新版 (本实验 v2) | 改进幅度 |
+|------|---------------|-----------------|----------|
 | Agent Loop 实现 | 手写 600 行 `LLMGenerationManager` | verl 原生 `ToolAgentLoop` | ✅ 消除 400+ 行样板代码 |
 | 工具接口 | `requests.post()` 硬编码 | `BaseTool` 标准接口 + YAML 配置 | ✅ 标准化 |
 | 多轮状态管理 | 手动 rolling state + info mask | verl 原生 `response_mask` | ✅ 大幅简化 |
 | 检索服务 | 基本 FastAPI | 增强版 + `/health` + LRU + 延迟统计 | ✅ 工程化提升 |
-| 奖励函数 | `qa_em_format.py` | `qa_em_tool_reward.py` (复现 + 改进) | ✅ 类型安全 + 更严格验证 |
+| 奖励函数 | `qa_em_format.py`（有 `<search>` 依赖、`extract_solution` bug） | `qa_em_tool_reward.py` v2（无 `<search>` 依赖、bug 已修复、返回 dict、wandb 分项指标） | ✅ 关键修复 + 全新设计 |
 | 异常检测 | ❌ 不存在 | 14 种异常类型 + GRPO loss mask | ✅ 全新的关键模块 |
-| 监控指标 | ❌ 仅 reward | 20+ wandb 指标 | ✅ 可观测性大幅提升 |
+| 监控指标 | ❌ 仅 reward | 20+ wandb 指标 + 6 个奖励分项 | ✅ 可观测性大幅提升 |
 | 数据格式 | 自定义 parquet | 标准 raw chat format | ✅ 生态兼容 |
 | GRPO 支持 | ❌ 不支持 | ✅ 完整支持 + loss mask | ✅ 全新 |
-| 实验设计 | 单一训练脚本 | Smoke Test → 小规模 → 正式 | ✅ 分层验证 |
+| 实验设计 | 单一训练脚本 | Smoke Test → 150 step → 正式 | ✅ 分层验证 |
 | verl 版本 | 旧版 vendored | 最新 pip 包 | ✅ 可升级 |
 | 可扩展性 | 修改 generation.py | 新增 BaseTool 子类 + YAML | ✅ 插件化 |
+| 自定义 reward 注册 | 通过 CLI 传 `reward_model.*` | 通过 `reward.custom_reward_function.path` 注册 | ✅ 标准化 |
 
 ---
 
-*文档版本: v1.0*
-*最后更新: 2026-07-13*
+*文档版本: v2.0*
+*最后更新: 2026-07-14*

@@ -80,15 +80,24 @@ class SearchTool(BaseTool):
         self.max_doc_chars = config.get("max_doc_chars", 1200)
         self.max_tool_response_chars = config.get("max_tool_response_chars", 6000)
 
-        # Session-level metrics accumulator
-        self._session_metrics: dict[str, float] = {}
-        self._session_latencies: list[float] = []
+        # Per-instance metrics (keyed by instance_id for concurrency safety)
+        self._metrics_by_instance: dict[str, dict] = {}
+        self._latencies_by_instance: dict[str, list] = {}
+        # Lazily-initialised HTTP session (reused across calls)
+        self._http_session: aiohttp.ClientSession | None = None
+
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        if self._http_session is None:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            )
+        return self._http_session
 
     async def create(self, instance_id: Optional[str] = None, **kwargs) -> tuple[str, ToolResponse]:
         """Reset per-trajectory metrics."""
         instance_id, response = await super().create(instance_id, **kwargs)
-        self._session_metrics = {}
-        self._session_latencies = []
+        self._metrics_by_instance[instance_id] = {}
+        self._latencies_by_instance[instance_id] = []
         return instance_id, response
 
     async def execute(
@@ -120,7 +129,7 @@ class SearchTool(BaseTool):
             response_text, error_type = await self._call_retrieval_service(query, topk)
         except asyncio.TimeoutError:
             latency_ms = (time.monotonic() - start_time) * 1000
-            self._record_metrics("timeout", latency_ms)
+            self._record_metrics(instance_id, "timeout", latency_ms)
             return self._make_error_response(
                 "timeout",
                 f"Retrieval service timed out after {self.timeout}s.",
@@ -128,7 +137,7 @@ class SearchTool(BaseTool):
             )
         except aiohttp.ClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
-            self._record_metrics("http_error", latency_ms)
+            self._record_metrics(instance_id, "http_error", latency_ms)
             return self._make_error_response(
                 "http_error",
                 f"HTTP error calling retrieval service: {e}",
@@ -136,7 +145,7 @@ class SearchTool(BaseTool):
             )
         except Exception as e:
             latency_ms = (time.monotonic() - start_time) * 1000
-            self._record_metrics("unknown_error", latency_ms)
+            self._record_metrics(instance_id, "unknown_error", latency_ms)
             logger.exception("SearchTool: unexpected error during retrieval")
             return self._make_error_response(
                 "unknown_error",
@@ -145,7 +154,7 @@ class SearchTool(BaseTool):
             )
 
         latency_ms = (time.monotonic() - start_time) * 1000
-        self._record_metrics("success", latency_ms)
+        self._record_metrics(instance_id, "success", latency_ms)
 
         # --- Format tool response ---
         num_docs = 0
@@ -210,22 +219,21 @@ class SearchTool(BaseTool):
         return tool_response, 0.0, metrics
 
     async def _call_retrieval_service(self, query: str, topk: int) -> tuple[str, str]:
-        """Make HTTP request to the local retrieval service."""
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                "queries": [query],
-                "topk": topk,
-                "return_scores": False,
-                "max_doc_chars": self.max_doc_chars,
-            }
-            async with session.post(
-                self.endpoint,
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=self.timeout),
-            ) as resp:
-                resp.raise_for_status()
-                text = await resp.text()
-                return text, "none"
+        """Make HTTP request to the local retrieval service (reuses session)."""
+        session = await self._get_http_session()
+        payload = {
+            "queries": [query],
+            "topk": topk,
+            "return_scores": False,
+            "max_doc_chars": self.max_doc_chars,
+        }
+        async with session.post(
+            self.endpoint,
+            json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+            return text, "none"
 
     def _make_error_response(
         self,
@@ -251,21 +259,30 @@ class SearchTool(BaseTool):
 
         return tool_response, 0.0, metrics
 
-    def _record_metrics(self, status: str, latency_ms: float) -> None:
-        """Update session-level metrics."""
-        self._session_metrics[status] = self._session_metrics.get(status, 0) + 1
-        self._session_latencies.append(latency_ms)
+    def _record_metrics(self, instance_id: str, status: str, latency_ms: float) -> None:
+        """Update per-instance metrics."""
+        if instance_id not in self._metrics_by_instance:
+            self._metrics_by_instance[instance_id] = {}
+            self._latencies_by_instance[instance_id] = []
+        self._metrics_by_instance[instance_id][status] = \
+            self._metrics_by_instance[instance_id].get(status, 0) + 1
+        self._latencies_by_instance[instance_id].append(latency_ms)
 
     async def release(self, instance_id: str, **kwargs) -> None:
-        """Log session-level metrics."""
-        if self._session_latencies:
-            avg_latency = sum(self._session_latencies) / len(self._session_latencies)
+        """Log per-instance metrics and close HTTP session."""
+        latencies = self._latencies_by_instance.get(instance_id, [])
+        metrics = self._metrics_by_instance.get(instance_id, {})
+        if latencies:
+            avg_latency = sum(latencies) / len(latencies)
             logger.info(
-                "SearchTool [%s] session stats: calls=%d, success=%d, errors=%d, avg_latency=%.1fms",
+                "SearchTool [%s] stats: calls=%d, success=%d, errors=%d, avg_latency=%.1fms",
                 instance_id[:8],
-                sum(self._session_metrics.values()),
-                self._session_metrics.get("success", 0),
-                self._session_metrics.get("http_error", 0) + self._session_metrics.get("timeout", 0),
+                sum(metrics.values()),
+                metrics.get("success", 0),
+                metrics.get("http_error", 0) + metrics.get("timeout", 0),
                 avg_latency,
             )
+        # Cleanup per-instance state
+        self._metrics_by_instance.pop(instance_id, None)
+        self._latencies_by_instance.pop(instance_id, None)
         await super().release(instance_id, **kwargs)
