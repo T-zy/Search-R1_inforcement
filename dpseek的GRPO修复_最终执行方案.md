@@ -1,5 +1,13 @@
 # GRPO 修复 — 最终执行方案
 
+> **执行状态追踪**（2026-07-14）:
+> - ✅ P0 全部完成（奖励函数重写、训练脚本注册、SearchTool 优化）
+> - ✅ P1 TrajectoryFilter 已完成（verl_src/core_algos.py 添加 valid_sample_mask）
+> - ✅ P2 Tool metrics 传入 reward 已完成（verl_src/tool_agent_loop.py 修改）
+> - ⬜ P1 数据格式确认 — 待完成
+> - ⬜ P2 自动 Early Stop — 待完成
+> - 📦 verl 已 vendored 到 `verl_src/`（version `0.9.0.dev`, commit `30119a25`）
+
 ## 三方观点汇总
 
 | 来源 | 文档 |

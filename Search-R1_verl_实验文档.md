@@ -2,7 +2,8 @@
 
 > **项目路径**: `/home/zytan/Search-R1_inforcement`
 > **原版仓库**: `/home/zytan/Search-R1` (基于旧版 vendored verl)
-> **新版框架**: `/home/zytan/verl` (最新版 `verl-project/verl`)
+> **新版框架**: `/home/zytan/verl` (最新版 `verl-project/verl`, `v0.9.0.dev` / commit `30119a25`)
+> **Vendored 源码**: `verl_src/`（已复制到项目内，含 3 处定制修改）
 > **目标模型**: Qwen2.5-1.5B / Qwen2.5-3B-Instruct
 > **硬件环境**: 4× NVIDIA L20 (46GB)
 
@@ -607,7 +608,7 @@ results = evaluate_file("predictions.jsonl", "ground_truth.jsonl")
 
 | 维度 | 原版 | 新版 |
 |------|------|------|
-| verl 升级 | ❌ 需要手动合并新版 vendored 代码 | ✅ pip install -e . 即可升级 |
+| verl 升级 | ❌ 需要手动合并新版 vendored 代码 | ✅ 通过 `verl_src/VERL_VERSION.md` 记录的 diff 可追踪升级 |
 | 新增工具 | ❌ 需要修改 generation.py 的 execute_predictions() | ✅ 新建 `BaseTool` 子类，YAML 配置 |
 | 修改检索逻辑 | ❌ 需要修改 generation.py 和 retrieval_server.py | ✅ 仅需修改 SearchTool.execute() |
 | 调试 | ❌ 手写 state machine 难以跟踪 | ✅ verl 原生 `rollout_trace_op` + wandb 日志 |
@@ -628,7 +629,7 @@ results = evaluate_file("predictions.jsonl", "ground_truth.jsonl")
 
 **收益**：
 - 消除了 400+ 行手写 agent loop 代码
-- 可直接使用 verl 后续版本的所有 agent loop 优化
+- 可直接使用 verl 后续版本的所有 agent loop 优化（通过将定制 diff 应用到新版 verl）
 - 工具调用、格式解析、状态管理全部标准化
 
 #### 创新 2：异常轨迹监控与 GRPO loss mask
@@ -700,14 +701,18 @@ results = evaluate_file("predictions.jsonl", "ground_truth.jsonl")
 # 1. 激活检索服务环境
 conda activate retriever
 
-# 2. 安装 verl
-cd /home/zytan/verl
-pip install -e .
-
-# 3. 安装本项目的依赖 (如果需要更复杂的 reward manager 集成)
+# 2. 设置 PYTHONPATH 指向 vendored verl_src（项目内已包含 verl 源码）
 cd /home/zytan/Search-R1_inforcement
+export PYTHONPATH="${PWD}/verl_src:${PYTHONPATH}"
+
+# 3. 或者使用 pip install -e 安装原始 verl（不推荐，可能丢失定制修改）
+# cd /home/zytan/verl && pip install -e .
+
+# 4. 安装本项目的依赖
 pip install -r recipe/search_r1_verl/retrieval_service/requirements.txt
 ```
+
+> **注意**: 本项目在 `verl_src/` 中 vendored 了 verl `v0.9.0.dev`（commit `30119a25`）并包含 3 处定制修改（GRPO TrajectoryFilter、tool metrics 传入 reward）。训练时务必使用 `PYTHONPATH` 指向 `verl_src/`，而非原始 `/home/zytan/verl`。
 
 ### 5.2 启动检索服务
 
@@ -858,7 +863,7 @@ python /home/zytan/Search-R1_inforcement/recipe/search_r1_verl/evaluation/eval_e
 | 数据格式 | 自定义 parquet | 标准 raw chat format | ✅ 生态兼容 |
 | GRPO 支持 | ❌ 不支持 | ✅ 完整支持 + loss mask | ✅ 全新 |
 | 实验设计 | 单一训练脚本 | Smoke Test → 150 step → 正式 | ✅ 分层验证 |
-| verl 版本 | 旧版 vendored | 最新 pip 包 | ✅ 可升级 |
+| verl 版本 | 旧版 vendored（无版本号） | `v0.9.0.dev`（commit `30119a25`）vendored 到 `verl_src/` | ✅ 有版本追踪 + 修改记录 |
 | 可扩展性 | 修改 generation.py | 新增 BaseTool 子类 + YAML | ✅ 插件化 |
 | 自定义 reward 注册 | 通过 CLI 传 `reward_model.*` | 通过 `reward.custom_reward_function.path` 注册 | ✅ 标准化 |
 

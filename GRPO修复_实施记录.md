@@ -170,16 +170,21 @@ async def _get_http_session(self):
 
 ---
 
-## 未完成的操作（下一阶段）
+## 已完成的操作（后续追加）
 
-以下操作在最终方案中规划但尚未实施：
+以下操作在原最终方案中规划为 P1/P2，已在后续实施中完成：
+
+| 操作 | 原优先级 | 完成方式 |
+|------|---------|----------|
+| 接入 TrajectoryFilter（正确方式） | P1 | 在 `verl_src/trainer/ppo/core_algos.py` 中为两个 GRPO advantage 函数添加 `valid_sample_mask` 参数 |
+| 增加 wandb 指标（grpo 零方差等） | P1 | 通过 reward 函数返回 dict 自动注册 6 个分项指标 |
+| Tool metrics 传入 reward（第二阶段） | P2 | 在 `verl_src/experimental/agent_loop/tool_agent_loop.py` 中捕获 tool_metrics 写入 extra_fields |
+
+## 仍待完成的操作
 
 | 操作 | 优先级 | 预计工作量 | 依赖 |
 |------|--------|-----------|------|
-| 接入 TrajectoryFilter（正确方式） | P1 | 2h | 需找到 verl GRPO advantage 计算位置 |
-| 增加 wandb 指标（grpo 零方差等） | P1 | 1h | 需要跑通一次训练获取 baseline |
 | 确认数据格式（uid, data_source） | P1 | 30min | 需要检查实际 parquet 数据 |
-| Tool metrics 传入 reward（第二阶段） | P2 | 2h | 需要修改 ToolAgentLoop |
 | 自动 Early Stop | P2 | 1h | 需要先有稳定的监控指标 |
 
 ---
