@@ -82,32 +82,35 @@ def aggregate_trajectory_metrics(
         key = f"trajectory/{anomaly_type.value}_rate"
         metrics[key] = anomaly_counter.get(anomaly_type.value, 0) / max(n_total, 1)
 
-    # Tool metrics
-    if tool_latencies:
-        sorted_latencies = sorted(tool_latencies)
+    # Tool metrics: latency
+    n_lat = 0
+    if tool_latencies is not None and len(tool_latencies) > 0:
+        sorted_latencies = sorted(float(v) for v in tool_latencies)
         n_lat = len(sorted_latencies)
         metrics["tool/search_latency_ms_mean"] = sum(sorted_latencies) / n_lat
         metrics["tool/search_latency_ms_p50"] = sorted_latencies[n_lat // 2]
-        metrics["tool/search_latency_ms_p95"] = sorted_latencies[int(n_lat * 0.95)]
+        p95_index = min(n_lat - 1, int(n_lat * 0.95))
+        metrics["tool/search_latency_ms_p95"] = sorted_latencies[p95_index]
         metrics["tool/search_latency_ms_max"] = sorted_latencies[-1]
         metrics["tool/search_calls_total"] = n_lat
 
-    if tool_success_flags and n_lat > 0:
-        n_success = sum(tool_success_flags)
-        metrics["tool/search_success_rate"] = n_success / max(len(tool_success_flags), 1)
+    # Tool metrics: success rate
+    if tool_success_flags is not None and len(tool_success_flags) > 0:
+        n_success = sum(bool(v) for v in tool_success_flags)
+        metrics["tool/search_success_rate"] = n_success / len(tool_success_flags)
         metrics["tool/search_success"] = n_success
         metrics["tool/search_failed"] = len(tool_success_flags) - n_success
 
     # Rollout metrics
-    if num_turns_list:
+    if num_turns_list is not None and len(num_turns_list) > 0:
         metrics["rollout/turns_mean"] = sum(num_turns_list) / max(len(num_turns_list), 1)
         metrics["rollout/turns_max"] = max(num_turns_list)
 
-    if search_calls_list:
+    if search_calls_list is not None and len(search_calls_list) > 0:
         metrics["rollout/search_calls_mean"] = sum(search_calls_list) / max(len(search_calls_list), 1)
 
     # Reward metrics
-    if rewards:
+    if rewards is not None and len(rewards) > 0:
         valid_rewards = [r for r, v in zip(rewards, all_valid_flags) if v]
         if valid_rewards:
             metrics["reward/mean"] = sum(valid_rewards) / len(valid_rewards)

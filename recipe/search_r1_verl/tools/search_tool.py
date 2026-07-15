@@ -157,8 +157,8 @@ class SearchTool(BaseTool):
         self._record_metrics(instance_id, "success", latency_ms)
 
         # --- Format tool response ---
-        num_docs = 0
         response_truncated = False
+        formatted_parts = []
 
         try:
             parsed = json.loads(response_text)
@@ -170,7 +170,6 @@ class SearchTool(BaseTool):
         except (json.JSONDecodeError, IndexError, TypeError):
             docs = []
 
-        formatted_parts = []
         for i, doc in enumerate(docs):
             if isinstance(doc, dict):
                 # Support both nested {"document": {...}} and flat doc formats
@@ -193,27 +192,43 @@ class SearchTool(BaseTool):
                 part += f"(Title: {title})"
             part += f":\n{text}"
             formatted_parts.append(part)
-            num_docs += 1
 
-        formatted_text = "<information>\n" + "\n\n".join(formatted_parts) + "\n</information>"
+        num_docs = len(formatted_parts)
 
-        # Truncate entire tool response if needed
-        if len(formatted_text) > self.max_tool_response_chars:
-            formatted_text = formatted_text[:self.max_tool_response_chars] + "\n... [truncated]"
+        # Build body first, then wrap in tags to preserve XML closure
+        body = "\n\n".join(formatted_parts)
+
+        if num_docs == 0:
+            search_success = 0
+            search_failed = 1
+            exception_type = "empty_result"
+            body = "Search failed: No relevant documents were returned."
+        else:
+            search_success = 1
+            search_failed = 0
+            exception_type = "none"
+
+        reserved_chars = len("<information>\n\n</information>") + 32
+        max_body_chars = max(0, self.max_tool_response_chars - reserved_chars)
+
+        if len(body) > max_body_chars:
+            body = body[:max_body_chars] + "\n... [truncated]"
             response_truncated = True
+
+        formatted_text = "<information>\n" + body + "\n</information>"
 
         tool_response = ToolResponse(text=formatted_text)
 
         metrics = {
             "tool/search_called": 1,
-            "tool/search_success": 1,
-            "tool/search_failed": 0,
+            "tool/search_success": search_success,
+            "tool/search_failed": search_failed,
             "tool/search_timeout": 0,
             "tool/search_empty_query": 0,
             "tool/search_latency_ms": latency_ms,
             "tool/search_num_docs": num_docs,
             "tool/search_response_truncated": int(response_truncated),
-            "tool/search_exception_type": "none",
+            "tool/search_exception_type": exception_type,
         }
 
         return tool_response, 0.0, metrics

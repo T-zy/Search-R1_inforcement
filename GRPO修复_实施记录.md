@@ -180,24 +180,102 @@ async def _get_http_session(self):
 | 增加 wandb 指标（grpo 零方差等） | P1 | 通过 reward 函数返回 dict 自动注册 6 个分项指标 |
 | Tool metrics 传入 reward（第二阶段） | P2 | 在 `verl_src/experimental/agent_loop/tool_agent_loop.py` 中捕获 tool_metrics 写入 extra_fields |
 
+## 2026-07-14 最终实施方案执行记录
+
+依据 `GPT最终实施方案_v2.0.md` 执行了以下修改：
+
+### 第 1 步：加载 patched verl
+- 创建 `verl -> verl_src` 符号链接
+- 修改两个训练脚本：`set -euo pipefail`、`export PYTHONPATH`、`cd "${PROJECT_ROOT}"`
+- 删除 `VERL_ROOT="/home/zytan/verl"` 和 `cd "${VERL_ROOT}"`
+- 增加强制启动检查（验证 `verl.__file__`、`core_algos`、`ToolAgentLoop` 均指向项目内路径）
+- 增加 KL 配置：`actor_rollout_ref.actor.use_kl_loss=true` 等
+
+### 第 2 步：修复 SearchTool
+- 空结果判定为失败：`num_docs==0` 时 `search_success=0`、`exception_type="empty_result"`
+- `</information>` 标签保护：先拼 body 控制长度，再加标签
+- 删除 `"tool/search_success": 1` 固定值，改为条件赋值
+
+### 第 3 步：修改 reward 函数
+- 新增 `extract_tool_state()` 函数：Tool metrics 为主，XML fallback
+- `compute_score()` 使用 `has_successful_search` 替代旧的 `search_success`
+- 多跳惩罚条件改为 `not has_successful_search` 而非 `num_search_calls == 0`
+- 返回字段增加 `tool_metrics_available`、`search_success_count`、`search_failed_count`、`search_timeout_count`、`search_num_docs`、`all_searches_successful`、`missing_successful_search_penalty`
+
+### 第 4 步：验证 Tool metrics 管道
+- Smoke test 脚本增加 `export SEARCH_R1_DEBUG_PIPELINE=1`
+- reward 文件增加模块级 `_PIPELINE_DEBUG_PRINTED` 和一次性调试日志
+
+### 第 5 步：接入 TrajectoryFilter
+- `trajectory_filter.py`：`DEFAULT_MASK_ON` 移除 `TOOL_RESPONSE_TRUNCATED`、`MAX_TOOL_CALLS_EXCEEDED`
+- `ray_trainer.py`：
+  - 新增 `build_trajectory_filter_outputs()` 函数
+  - 新增 `compute_grpo_group_metrics()` 函数
+  - 在 `extract_reward()` 后集成 TrajectoryFilter：生成 `valid_sample_mask`、清零 invalid `response_mask`、聚合 trajectory/group metrics
+  - reward extra info 提前合并到 `non_tensor_batch`
+
+### 第 6 步：修复非向量版 GRPO
+- 完整重写 `compute_grpo_outcome_advantage()`：`normalized_scores = torch.zeros_like(scores)` 确保 invalid 默认为 0
+- `n_valid < 2` 时整组 `normalized_scores[group_indices] = 0.0`
+- 使用 `valid_mask[group_indices]` 索引，只计算有效轨迹的 mean/std
+
+### 第 7 步：修复 trajectory_metrics.py
+- 修复空数组 `n_lat` 未定义 bug
+- 所有 `if x:` 改为显式 `if x is not None and len(x) > 0:`
+- 增加 `float()` 转换处理 NumPy 类型
+
+### 第 8 步：开启 actor KL loss ✓（在第 1 步中一并完成）
+
+### 第 9 步：增加 system prompt
+- HotpotQA 增加 system prompt（多跳 + 必须搜索 + `<answer>` 格式）
+- NQ 增加 system prompt（可搜索 + `<answer>` 格式）
+- ability 字段：HotpotQA 改为 `"multi-hop-reasoning"`
+
+### 第 10 步：单元测试（31 个全部通过）
+| 测试文件 | 用例数 | 状态 |
+|---------|--------|------|
+| `tests/test_qa_em_tool_reward.py` | 17 | ✅ 全部通过 |
+| `tests/test_search_tool_formatting.py` | 6 | ✅ 全部通过 |
+| `tests/test_tool_metrics_pipeline.py` | 8 | ✅ 全部通过 |
+| `tests/test_grpo_valid_sample_mask.py` | 4 | ⏳ 需 search-r1 conda 环境（含 torch） |
+
+---
+
 ## 仍待完成的操作
 
-| 操作 | 优先级 | 预计工作量 | 依赖 |
-|------|--------|-----------|------|
-| 确认数据格式（uid, data_source） | P1 | 30min | 需要检查实际 parquet 数据 |
-| 自动 Early Stop | P2 | 1h | 需要先有稳定的监控指标 |
+| 操作 | 优先级 | 说明 |
+|------|--------|------|
+| 重新生成 Parquet 数据 | **P0** | 修改转换脚本后必须重新执行并覆盖 |
+| GRPO mask 单元测试 | P1 | 需要 conda activate search-r1（含 torch） |
+| 2-step smoke test | P1 | 完成上述后运行 |
+| Tool-Agent SFT 冷启动 | P1 | 50-step GRPO 前必须完成 |
+| 50-step GRPO 训练 | P2 | Smoke test 通过后 |
+| 自动 Early Stop | P2 | 需先有稳定监控指标 |
 
 ---
 
 ## 当前文件状态
 
-### 修改的文件
+### 本次修改的文件
 
-| 文件 | 修改内容 | 行数 |
-|------|----------|------|
-| `rewards/qa_em_tool_reward.py` | 完全重写（新签名 + 简化逻辑 + dict 返回） | ~150 |
-| `tools/search_tool.py` | HTTP session 复用 + 指标按 instance_id | ~260 |
-| `scripts/train_grpo_qwen25_1p5b.sh` | 注册 reward + 参数调整 | ~120 |
+| 文件 | 修改内容 |
+|------|----------|
+| `verl_src/trainer/ppo/ray_trainer.py` | 新增 `build_trajectory_filter_outputs()`、`compute_grpo_group_metrics()`、训练循环集成 TrajectoryFilter |
+| `verl_src/trainer/ppo/core_algos.py` | 完整重写 `compute_grpo_outcome_advantage()`（修复 mask 实现） |
+| `recipe/search_r1_verl/rewards/qa_em_tool_reward.py` | 新增 `extract_tool_state()`、`import os`、pipeline debug 日志 |
+| `recipe/search_r1_verl/tools/search_tool.py` | 空结果判定、XML 标签保护、metrics 条件赋值 |
+| `recipe/search_r1_verl/monitoring/trajectory_filter.py` | 更新 `DEFAULT_MASK_ON` |
+| `recipe/search_r1_verl/monitoring/trajectory_metrics.py` | 修复空数组 bug、显式 None 检查 |
+| `recipe/search_r1_verl/scripts/train_grpo_qwen25_1p5b.sh` | PYTHONPATH、启动检查、KL 配置 |
+| `recipe/search_r1_verl/scripts/train_grpo_smoke_test.sh` | PYTHONPATH、启动检查、KL 配置、DEBUG_PIPELINE |
+| `recipe/search_r1_verl/data/convert_hotpotqa_to_parquet.py` | 增加 system prompt、ability 改为 multi-hop-reasoning |
+| `recipe/search_r1_verl/data/convert_nq_to_parquet.py` | 增加 system prompt |
+| `tests/test_qa_em_tool_reward.py` | 17 个 reward 测试用例 |
+| `tests/test_search_tool_formatting.py` | 6 个格式化测试用例 |
+| `tests/test_tool_metrics_pipeline.py` | 8 个 pipeline 测试用例 |
+| `tests/test_grpo_valid_sample_mask.py` | 4 个 GRPO mask 测试用例（需 torch） |
+| `tests/__init__.py` | 空包文件 |
+| `verl -> verl_src` | 符号链接创建 |
 | `scripts/train_grpo_smoke_test.sh` | 注册 reward + 参数调整 | ~95 |
 
 ### 新增的文档

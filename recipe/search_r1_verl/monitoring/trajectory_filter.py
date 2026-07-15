@@ -59,9 +59,9 @@ DEFAULT_MASK_ON = {
     AnomalyType.TOOL_TIMEOUT,
     AnomalyType.TOOL_HTTP_ERROR,
     AnomalyType.TOOL_PARSE_ERROR,
-    AnomalyType.TOOL_RESPONSE_TRUNCATED,
+    AnomalyType.RETRIEVER_CRASH,
     AnomalyType.SEQUENCE_TRUNCATED,
-    AnomalyType.MAX_TOOL_CALLS_EXCEEDED,
+    AnomalyType.ROLLOUT_ENGINE_ERROR,
 }
 
 # Anomaly types that only penalize (no mask)

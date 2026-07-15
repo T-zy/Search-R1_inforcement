@@ -114,9 +114,23 @@ def main():
             skipped += 1
             continue
 
+        NQ_SYSTEM_PROMPT = (
+            "You are a factual question answering agent.\n"
+            "\n"
+            "You may answer directly when you are confident. Use the search tool "
+            "when external evidence is needed.\n"
+            "\n"
+            "Always output the final answer using:\n"
+            "\n"
+            "<answer>final answer</answer>\n"
+            "\n"
+            "Keep the answer concise."
+        )
+
         record = {
             "data_source": "nq",
             "prompt": [
+                {"role": "system", "content": NQ_SYSTEM_PROMPT},
                 {"role": "user", "content": question}
             ],
             "ability": "fact-reasoning",

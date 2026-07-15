@@ -1,8 +1,10 @@
 #!/bin/bash
+set -euo pipefail
+set -x
 # ============================================================
 # GRPO Training Script - Qwen2.5-1.5B with verl Tool Agent Loop
 # 硬件: 4 × NVIDIA L20 (46GB)
-# 基于最新版 verl-project/verl
+# 基于 patched verl (verl -> verl_src symlink)
 # ============================================================
 # Usage:
 #   1. Start retrieval service (separate terminal):
@@ -14,8 +16,6 @@
 #      bash recipe/search_r1_verl/scripts/train_grpo_qwen25_1p5b.sh
 # ============================================================
 
-set -x  # verbose command echo
-
 export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -24,7 +24,7 @@ export VERL_LOGGING_LEVEL=INFO
 
 # ---- Paths (customize these!) ----
 PROJECT_ROOT="/home/zytan/Search-R1_inforcement"
-VERL_ROOT="/home/zytan/verl"
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
 # SFT冷启动后的模型权重路径 (先用Base模型测试，后续替换为SFT权重)
 SFT_MODEL_PATH="/media/public/RAIDStorageArray/workdir/zytan/Qwen2.5-1.5B-Instruct"
@@ -57,7 +57,39 @@ TOTAL_EPOCHS=15
 TOTAL_STEPS=150
 
 # ---- Run Training ----
-cd "${VERL_ROOT}" || { echo "Error: cannot cd to ${VERL_ROOT}"; exit 1; }
+mkdir -p "${PROJECT_ROOT}/logs"
+mkdir -p "${PROJECT_ROOT}/verl_checkpoints"
+
+cd "${PROJECT_ROOT}"
+
+# ---- 强制启动检查：确认 patched verl 被加载 ----
+python3 - <<'PY'
+import inspect
+import os
+import verl
+from verl.trainer.ppo import core_algos
+from verl.experimental.agent_loop import tool_agent_loop
+
+project_root = os.path.realpath("/home/zytan/Search-R1_inforcement")
+verl_path = os.path.realpath(verl.__file__)
+core_path = os.path.realpath(inspect.getsourcefile(core_algos.compute_grpo_outcome_advantage))
+tool_loop_path = os.path.realpath(inspect.getsourcefile(tool_agent_loop))
+
+print("=" * 80)
+print("verl package:", verl_path)
+print("GRPO implementation:", core_path)
+print("ToolAgentLoop:", tool_loop_path)
+print("=" * 80)
+
+for path in (verl_path, core_path, tool_loop_path):
+    if not path.startswith(project_root):
+        raise RuntimeError(f"Patched verl is not loaded: {path}")
+
+signature = inspect.signature(core_algos.compute_grpo_outcome_advantage)
+if "valid_sample_mask" not in signature.parameters:
+    raise RuntimeError("Loaded GRPO implementation does not support valid_sample_mask.")
+print("✅ All checks passed: patched verl is loaded.")
+PY
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -98,8 +130,10 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.ref.log_prob_micro_batch_size=${LOG_PROB_MICRO_BATCH_SIZE} \
-    algorithm.kl_ctrl.kl_coef=${KL_COEF} \
-    algorithm.kl_penalty=kl \
+    actor_rollout_ref.actor.use_kl_loss=true \
+    actor_rollout_ref.actor.kl_loss_coef=${KL_COEF} \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    algorithm.use_kl_in_reward=false \
     reward.custom_reward_function.path="${PROJECT_ROOT}/recipe/search_r1_verl/rewards/qa_em_tool_reward.py" \
     reward.custom_reward_function.name=compute_score \
     trainer.critic_warmup=0 \

@@ -286,6 +286,124 @@ def compute_advantage(
     return data
 
 
+def build_trajectory_filter_outputs(batch, max_response_length: int):
+    """
+    Build valid_sample_mask and trajectory metrics from tool metrics in non_tensor_batch.
+    Uses TrajectoryFilter to classify system anomalies vs model strategy errors.
+    """
+    from recipe.search_r1_verl.monitoring.trajectory_filter import TrajectoryFilter
+    from recipe.search_r1_verl.monitoring.trajectory_metrics import aggregate_trajectory_metrics
+
+    n = len(batch)
+
+    def numeric_array(name: str, default: float = 0.0):
+        value = batch.non_tensor_batch.get(name, np.full(n, default))
+        return np.asarray(value, dtype=float)
+
+    def object_array(name: str, default: str = "none"):
+        value = batch.non_tensor_batch.get(name, np.array([default] * n, dtype=object))
+        return np.asarray(value, dtype=object)
+
+    timeout = numeric_array("tool/search_timeout")
+    response_truncated = numeric_array("tool/search_response_truncated")
+    num_tool_calls = numeric_array("num_search_calls")
+    has_answer = numeric_array("has_final_answer")
+    answer_correct = numeric_array("answer_em")
+    exception_type = object_array("tool/search_exception_type")
+
+    prompt_width = batch.batch["prompts"].shape[-1]
+    response_lengths = (
+        batch.batch["attention_mask"][:, prompt_width:]
+        .sum(dim=-1)
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    trajectory_filter = TrajectoryFilter(min_valid_trajectories=2, max_tool_calls=10)
+
+    valid_flags = []
+    masked_flags = []
+    all_anomalies = []
+
+    for i in range(n):
+        tool_metrics = {
+            "tool/search_timeout": timeout[i],
+            "tool/search_exception_type": exception_type[i],
+            "tool/search_response_truncated": response_truncated[i],
+        }
+        should_mask, anomalies = trajectory_filter.classify_trajectory(
+            tool_metrics=tool_metrics,
+            response_length=int(response_lengths[i]),
+            max_response_length=max_response_length,
+            num_tool_calls=int(num_tool_calls[i]),
+            has_answer=bool(has_answer[i]),
+            has_valid_format=bool(has_answer[i]),
+            answer_correct=bool(answer_correct[i]),
+        )
+        valid_flags.append(not should_mask)
+        masked_flags.append(should_mask)
+        all_anomalies.append(anomalies)
+
+    valid_sample_mask = np.asarray(valid_flags, dtype=bool)
+
+    trajectory_metrics = aggregate_trajectory_metrics(
+        all_anomalies=all_anomalies,
+        all_valid_flags=valid_flags,
+        all_masked_flags=masked_flags,
+        tool_latencies=list(numeric_array("tool/search_latency_ms")),
+        tool_success_flags=list(numeric_array("has_successful_search").astype(bool)),
+        num_turns_list=list(numeric_array("__num_turns__").astype(int)),
+        search_calls_list=list(num_tool_calls.astype(int)),
+        rewards=list(
+            batch.batch["token_level_scores"].sum(dim=-1).detach().cpu().numpy()
+            if "token_level_scores" in batch.batch
+            else None
+        ),
+    )
+
+    trajectory_metrics["trajectory/response_truncated_rate"] = float(response_truncated.mean())
+
+    return valid_sample_mask, trajectory_metrics
+
+
+def compute_grpo_group_metrics(
+    rewards: np.ndarray,
+    uids: np.ndarray,
+    valid_mask: np.ndarray,
+    epsilon: float = 1e-8,
+) -> dict[str, float]:
+    """Compute per-group GRPO metrics for wandb logging."""
+    unique_uids = np.unique(uids)
+    total_groups = len(unique_uids)
+    dropped_groups = 0
+    effective_groups = 0
+    zero_variance_groups = 0
+    valid_counts = []
+
+    for uid in unique_uids:
+        group_mask = (uids == uid)
+        group_valid = group_mask & valid_mask
+        valid_scores = rewards[group_valid]
+        n_valid = len(valid_scores)
+        valid_counts.append(n_valid)
+
+        if n_valid < 2:
+            dropped_groups += 1
+            continue
+
+        effective_groups += 1
+        if np.std(valid_scores) <= epsilon:
+            zero_variance_groups += 1
+
+    return {
+        "grpo/effective_group_rate": effective_groups / max(total_groups, 1),
+        "grpo/dropped_group_rate": dropped_groups / max(total_groups, 1),
+        "grpo/zero_variance_group_rate": zero_variance_groups / max(effective_groups, 1),
+        "grpo/valid_samples_per_group_mean": float(np.mean(valid_counts)) if valid_counts else 0.0,
+    }
+
+
 @deprecated("Legacy trainer is deprecated, and wil be removed in v0.9.0. Please use `trainer.use_v1=True` instead.")
 class RayPPOTrainer:
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
@@ -1533,6 +1651,39 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+
+                    # ---- TrajectoryFilter: merge reward extra info and build valid_sample_mask ----
+                    if reward_extra_infos_dict:
+                        batch.non_tensor_batch.update({
+                            key: np.asarray(value) for key, value in reward_extra_infos_dict.items()
+                        })
+
+                    batch.batch["token_level_scores"] = reward_tensor
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                        valid_sample_mask, trajectory_metrics = build_trajectory_filter_outputs(
+                            batch=batch,
+                            max_response_length=self.config.data.max_response_length,
+                        )
+                        batch.non_tensor_batch["valid_sample_mask"] = valid_sample_mask
+
+                        # Zero out actor loss for invalid trajectories
+                        invalid_mask = torch.as_tensor(
+                            ~valid_sample_mask, dtype=torch.bool, device=batch.batch["response_mask"].device
+                        )
+                        batch.batch["response_mask"][invalid_mask] = 0
+
+                        # Update metrics
+                        metrics.update(trajectory_metrics)
+
+                        # GRPO group-level metrics
+                        sequence_rewards = reward_tensor.sum(dim=-1).detach().cpu().numpy()
+                        group_metrics = compute_grpo_group_metrics(
+                            rewards=sequence_rewards,
+                            uids=np.asarray(batch.non_tensor_batch["uid"]),
+                            valid_mask=valid_sample_mask,
+                        )
+                        metrics.update(group_metrics)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)

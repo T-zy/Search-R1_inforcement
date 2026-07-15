@@ -35,6 +35,7 @@ Key design principles:
   5. Search detection via <information> blocks
 """
 
+import os
 import re
 import string
 from typing import Any
@@ -94,7 +95,7 @@ def extract_information_blocks(text: str) -> list[str]:
 
 def extract_search_info(solution_str: str) -> tuple[int, bool]:
     """
-    Detect search activity from <information> blocks.
+    Detect search activity from <information> blocks (XML fallback).
 
     In verl Hermes Tool Agent format, the model does NOT emit <search>
     tags (it uses function-call instead), so we detect search by counting
@@ -121,6 +122,73 @@ def retrieval_contains_answer(information_blocks: list[str], targets: list[str])
 
 
 # ---------------------------------------------------------------------------
+# Tool metrics extraction (primary) with XML fallback
+# ---------------------------------------------------------------------------
+
+def extract_tool_state(
+    solution_str: str,
+    extra_info: dict | None,
+) -> dict:
+    """
+    Extract search tool state from structured metrics (primary) or XML fallback.
+
+    Structured Tool metrics take precedence when available.
+    XML <information> block parsing is used as fallback.
+    """
+    extra_info = extra_info or {}
+
+    information_blocks = extract_information_blocks(solution_str)
+    xml_search_count = len(information_blocks)
+    xml_success = any(
+        block.strip() and "Search failed:" not in block
+        for block in information_blocks
+    )
+
+    metrics_available = "tool/search_called" in extra_info
+
+    if metrics_available:
+        num_search_calls = int(extra_info.get("tool/search_called", 0))
+        search_success_count = int(extra_info.get("tool/search_success", 0))
+        search_failed_count = int(extra_info.get("tool/search_failed", 0))
+        search_timeout_count = int(extra_info.get("tool/search_timeout", 0))
+        search_num_docs = int(extra_info.get("tool/search_num_docs", 0))
+    else:
+        num_search_calls = xml_search_count
+        search_success_count = int(xml_success)
+        search_failed_count = int(xml_search_count > 0 and not xml_success)
+        search_timeout_count = 0
+        search_num_docs = int(xml_success)
+
+    has_successful_search = (
+        num_search_calls > 0
+        and search_success_count > 0
+        and search_num_docs > 0
+    )
+
+    all_searches_successful = (
+        num_search_calls > 0
+        and search_success_count == num_search_calls
+        and search_failed_count == 0
+    )
+
+    return {
+        "metrics_available": metrics_available,
+        "information_blocks": information_blocks,
+        "num_search_calls": num_search_calls,
+        "search_success_count": search_success_count,
+        "search_failed_count": search_failed_count,
+        "search_timeout_count": search_timeout_count,
+        "search_num_docs": search_num_docs,
+        "has_successful_search": has_successful_search,
+        "all_searches_successful": all_searches_successful,
+    }
+
+
+# ---- Pipeline debug logging ----
+_PIPELINE_DEBUG_PRINTED = False
+
+
+# ---------------------------------------------------------------------------
 # Main reward function (verl-native interface)
 # ---------------------------------------------------------------------------
 
@@ -134,12 +202,15 @@ def compute_score(
     """
     Compute reward for a single GRPO trajectory.
 
+    Tool metrics from structured extra_info are used as primary source.
+    XML <information> block parsing is used as fallback.
+
     Args:
         data_source: Dataset identifier (e.g. "nq", "hotpotqa").
         solution_str: Full assistant response text (including tool responses).
         ground_truth: Must contain ``{"target": ["answer1", ...]}``.
         extra_info: Optional metadata from ToolAgentLoop (may include
-            ``num_search_calls``, ``search_success_count`` in future).
+            ``tool/search_called``, ``tool/search_success``, etc.).
 
     Returns:
         dict with ``"score"`` (float) as the primary reward, plus per-component
@@ -154,11 +225,24 @@ def compute_score(
     has_answer = answer is not None
     answer_correct = has_answer and em_check(answer, targets)
 
-    # ---- Search detection ----
-    num_search_calls, search_success = extract_search_info(solution_str)
+    # ---- Search detection (metrics primary, XML fallback) ----
+    tool_state = extract_tool_state(solution_str, extra_info)
+    has_successful_search = tool_state["has_successful_search"]
+    num_search_calls = tool_state["num_search_calls"]
+
+    # ---- Pipeline debug logging (one-shot) ----
+    global _PIPELINE_DEBUG_PRINTED
+    if (
+        os.getenv("SEARCH_R1_DEBUG_PIPELINE", "0") == "1"
+        and not _PIPELINE_DEBUG_PRINTED
+    ):
+        print(f"[Search-R1 pipeline] data_source={data_source}")
+        print(f"[Search-R1 pipeline] extra_info keys={sorted(extra_info.keys()) if extra_info else 'EMPTY'}")
+        print(f"[Search-R1 pipeline] tool_state={tool_state}")
+        _PIPELINE_DEBUG_PRINTED = True
 
     # ---- Retrieval evidence check ----
-    info_blocks = extract_information_blocks(solution_str)
+    info_blocks = tool_state["information_blocks"]
     retrieval_ok = retrieval_contains_answer(info_blocks, targets) if info_blocks else False
 
     # ---- Reward computation ----
@@ -173,24 +257,33 @@ def compute_score(
     if has_answer:
         reward += 0.1
 
-    if search_success:
+    if has_successful_search:
         reward += 0.05
 
     if retrieval_ok:
         reward += 0.05
 
-    if is_multi_hop and num_search_calls == 0:
+    # 注意：失败搜索不能绕过多跳搜索惩罚
+    if is_multi_hop and not has_successful_search:
         reward -= 0.2
 
     reward = max(-0.2, min(1.0, reward))
+
+    missing_penalty = float(is_multi_hop and not has_successful_search)
 
     # ---- Return as dict for wandb logging ----
     return {
         "score": float(reward),
         "answer_em": float(answer_correct),
         "has_final_answer": float(has_answer),
-        "num_search_calls": float(num_search_calls),
-        "search_success": float(search_success),
+        "tool_metrics_available": float(tool_state["metrics_available"]),
+        "num_search_calls": float(tool_state["num_search_calls"]),
+        "search_success_count": float(tool_state["search_success_count"]),
+        "search_failed_count": float(tool_state["search_failed_count"]),
+        "search_timeout_count": float(tool_state["search_timeout_count"]),
+        "search_num_docs": float(tool_state["search_num_docs"]),
+        "has_successful_search": float(tool_state["has_successful_search"]),
+        "all_searches_successful": float(tool_state["all_searches_successful"]),
         "retrieval_correct": float(retrieval_ok),
-        "no_search_penalty": float(is_multi_hop and num_search_calls == 0),
+        "missing_successful_search_penalty": missing_penalty,
     }

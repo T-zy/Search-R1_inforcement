@@ -280,7 +280,8 @@ def compute_grpo_outcome_advantage(
     When ``valid_sample_mask`` is provided, system-anomaly trajectories (timeout,
     HTTP error, truncation, etc.) are excluded from the group mean/std calculation
     so they do NOT pollute the GRPO baseline. Groups with fewer than 2 valid
-    trajectories are zeroed out entirely.
+    trajectories are zeroed out entirely. Invalid trajectories (valid_sample_mask=False)
+    have their advantage set to 0.
 
     Args:
         token_level_rewards: shape (bs, response_length)
@@ -295,49 +296,41 @@ def compute_grpo_outcome_advantage(
     Returns:
         (advantages, returns) both shape (bs, response_length)
     """
-    scores = token_level_rewards.sum(dim=-1)
-
-    id2score = defaultdict(list)
-    id2valid = defaultdict(list)
-    id2mean = {}
-    id2std = {}
-
     with torch.no_grad():
-        bsz = scores.shape[0]
+        scores = token_level_rewards.sum(dim=-1)
 
-        # --- Build per-group score lists, respecting valid_sample_mask ---
-        for i in range(bsz):
-            id2score[index[i]].append(scores[i])
-        if valid_sample_mask is not None:
-            mask = torch.as_tensor(valid_sample_mask, dtype=torch.bool, device=scores.device)
-            for i in range(bsz):
-                id2valid[index[i]].append(bool(mask[i]))
+        if valid_sample_mask is None:
+            valid_mask = torch.ones(scores.shape[0], dtype=torch.bool, device=scores.device)
         else:
-            for i in range(bsz):
-                id2valid[index[i]].append(True)
+            valid_mask = torch.as_tensor(valid_sample_mask, dtype=torch.bool, device=scores.device)
 
-        for idx in id2score:
-            scores_tensor = torch.stack(id2score[idx])
-            valid_mask_tensor = torch.tensor(id2valid[idx], dtype=torch.bool)
-            n_valid = valid_mask_tensor.sum().item()
+        normalized_scores = torch.zeros_like(scores)
 
-            if n_valid < 2:
-                # Not enough valid trajectories in this group -> zero everything
-                id2mean[idx] = torch.tensor(0.0, device=scores.device)
-                id2std[idx] = torch.tensor(1.0, device=scores.device)
-            else:
-                valid_scores = scores_tensor[valid_mask_tensor]
-                id2mean[idx] = torch.mean(valid_scores)
-                id2std[idx] = torch.std(valid_scores)
+        for uid in np.unique(index):
+            group_indices_np = np.where(index == uid)[0]
+            group_indices = torch.as_tensor(group_indices_np, dtype=torch.long, device=scores.device)
 
-        for i in range(bsz):
+            valid_indices = group_indices[valid_mask[group_indices]]
+
+            if valid_indices.numel() < 2:
+                # Not enough valid trajectories in this group -> zero out the entire group
+                normalized_scores[group_indices] = 0.0
+                continue
+
+            valid_scores = scores[valid_indices]
+            group_mean = valid_scores.mean()
+            group_std = valid_scores.std()
+
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                normalized_scores[valid_indices] = (valid_scores - group_mean) / (group_std + epsilon)
             else:
-                scores[i] = scores[i] - id2mean[index[i]]
-        scores = scores.unsqueeze(-1) * response_mask
+                normalized_scores[valid_indices] = valid_scores - group_mean
 
-    return scores, scores
+            # Invalid trajectories in this group remain zero (already 0 from torch.zeros_like)
+
+        advantages = normalized_scores.unsqueeze(-1) * response_mask
+
+    return advantages, advantages
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)

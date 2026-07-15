@@ -93,12 +93,28 @@ def main():
             skipped += 1
             continue
 
+        HOTPOT_SYSTEM_PROMPT = (
+            "You are a retrieval-augmented question answering agent.\n"
+            "\n"
+            "This question may require multi-hop reasoning. You must use the search "
+            "tool to retrieve relevant evidence before answering. You may search "
+            "multiple times when necessary.\n"
+            "\n"
+            "After gathering enough evidence, output the final answer using exactly:\n"
+            "\n"
+            "<answer>final answer</answer>\n"
+            "\n"
+            "Keep the content inside <answer> concise. Do not include explanations "
+            "inside the answer tag."
+        )
+
         record = {
             "data_source": "hotpotqa",
             "prompt": [
+                {"role": "system", "content": HOTPOT_SYSTEM_PROMPT},
                 {"role": "user", "content": question}
             ],
-            "ability": "fact-reasoning",
+            "ability": "multi-hop-reasoning",
             "reward_model": {
                 "style": "rule",
                 "ground_truth": {
