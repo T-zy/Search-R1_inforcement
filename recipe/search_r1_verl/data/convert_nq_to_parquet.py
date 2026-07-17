@@ -44,7 +44,21 @@ def normalize_answer(s: str) -> str:
 
 
 def extract_nq_answer(example: dict) -> list[str]:
-    """Extract short answers from NQ example."""
+    """Extract short answers from NQ example.
+
+    Supports both:
+    - New nq_open format: {'answer': ['answer1', 'answer2']}
+    - Old format with annotations: {'annotations': [...]}
+    """
+    # New format: direct 'answer' key (list[str])
+    if "answer" in example:
+        answers = example["answer"]
+        if isinstance(answers, list):
+            return [a.strip() for a in answers if a.strip()]
+        elif isinstance(answers, str):
+            return [answers.strip()]
+
+    # Old format: annotations
     answers = set()
     if "annotations" in example and example["annotations"]:
         for annotation in example["annotations"]:
@@ -54,7 +68,6 @@ def extract_nq_answer(example: dict) -> list[str]:
                         for t in sa["text"]:
                             if t.strip():
                                 answers.add(t.strip())
-            # Also check yes/no answers
             if "yes_no_answer" in annotation:
                 yn = annotation["yes_no_answer"]
                 if yn in ("YES", "NO"):
@@ -63,8 +76,16 @@ def extract_nq_answer(example: dict) -> list[str]:
 
 
 def extract_nq_question(example: dict) -> str:
-    """Extract question text from NQ example."""
-    return example.get("question", {}).get("text", "").strip()
+    """Extract question text from NQ example.
+
+    Supports both:
+    - New nq_open format: {'question': '...'} (str)
+    - Old format: {'question': {'text': '...'}}
+    """
+    question = example.get("question", "")
+    if isinstance(question, dict):
+        return question.get("text", "").strip()
+    return str(question).strip()
 
 
 def main():
@@ -102,29 +123,24 @@ def main():
             skipped += 1
             continue
 
-        # For nq_open, answers are directly available
-        if "answer" in example:
-            answers_text = example["answer"]
-            if isinstance(answers_text, list):
-                answers = [a.strip() for a in answers_text if a.strip()]
-            elif isinstance(answers_text, str):
-                answers = [answers_text.strip()]
-
         if not answers:
             skipped += 1
             continue
 
         NQ_SYSTEM_PROMPT = (
-            "You are a factual question answering agent.\n"
+            "You are a factual question answering agent. You MUST search for evidence "
+            "before answering every question, even if you think you know the answer.\n"
             "\n"
-            "You may answer directly when you are confident. Use the search tool "
-            "when external evidence is needed.\n"
+            "To search, use the following exact format:\n"
+            "<search>your search query here</search>\n"
             "\n"
-            "Always output the final answer using:\n"
+            "After searching, you will receive information between <information> and "
+            "</information>. Use that evidence to formulate your answer.\n"
             "\n"
+            "Finally, output the answer using:\n"
             "<answer>final answer</answer>\n"
             "\n"
-            "Keep the answer concise."
+            "Keep the answer concise. Do NOT answer without searching first."
         )
 
         record = {
@@ -149,11 +165,18 @@ def main():
 
     print(f"Processed: {len(records)} valid, {skipped} skipped")
 
-    # Save as parquet
-    output_path = os.path.join(args.output_dir, f"{args.split}.parquet")
+    # Save as parquet with dataset name prefix to avoid overwriting
+    output_path = os.path.join(args.output_dir, f"nq_{args.split}.parquet")
     df = pd.DataFrame(records)
     df.to_parquet(output_path, index=False)
     print(f"Saved {len(records)} records to {output_path}")
+
+    # If this is the only dataset, also save without prefix for backward compatibility
+    # When both NQ and HotpotQA are processed, use merge script instead
+    nq_only_path = os.path.join(args.output_dir, f"{args.split}.parquet")
+    if not os.path.exists(nq_only_path):
+        df.to_parquet(nq_only_path, index=False)
+        print(f"Also saved fallback to {nq_only_path}")
 
 
 if __name__ == "__main__":

@@ -30,3 +30,12 @@ evaluation_results/
 
 # Environment files
 .env
+verl_checkpoints/
+wandb/
+outputs/
+__pycache__/
+*.parquet
+*.log
+*.msgpack
+*.h5
+wandb_export_*.csv

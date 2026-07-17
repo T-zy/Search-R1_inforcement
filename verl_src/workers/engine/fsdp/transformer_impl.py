@@ -254,6 +254,7 @@ class FSDPEngine(BaseEngine):
                     torch_dtype=torch_dtype,
                     config=self.model_config.hf_config,
                     trust_remote_code=self.model_config.trust_remote_code,
+                    attn_implementation="sdpa",
                 )
 
                 # Strip sub-modules listed in _verl_strip_modules (e.g.

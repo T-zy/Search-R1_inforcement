@@ -18,16 +18,27 @@ set -x
 
 export HF_ENDPOINT=https://hf-mirror.com
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True 与 vllm 0.19+ CuMemAllocator 不兼容
+# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# VLLM_ATTENTION_BACKEND 让 vllm 自动选择（vllm 0.19+ 默认 FLASH_ATTN/FLASHINFER）
+# export VLLM_ATTENTION_BACKEND=XFORMERS
 export VERL_LOGGING_LEVEL=INFO
+
+# 调试开关：首次计算 reward 时打印 tool metrics 管道状态
+export SEARCH_R1_DEBUG_PIPELINE=1
+
+pip install --upgrade wandb -q 2>/dev/null || true
+
+
+# 清除系统 CUDA 库路径，避免与 torch 自带的 CUDA 12.4 冲突
+unset LD_LIBRARY_PATH
 
 # ---- Paths (customize these!) ----
 PROJECT_ROOT="/home/zytan/Search-R1_inforcement"
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
 
-# SFT冷启动后的模型权重路径 (先用Base模型测试，后续替换为SFT权重)
-SFT_MODEL_PATH="/media/public/RAIDStorageArray/workdir/zytan/Qwen2.5-1.5B-Instruct"
+# SFT冷启动后的模型权重路径
+SFT_MODEL_PATH="/media/public/RAIDStorageArray/workdir/zytan/checkpoints/qwen2.5-1.5b-searchr1-sft-merged"
 
 # 数据路径 (预先用 convert_nq_to_parquet.py 等脚本生成)
 DATA_DIR="/media/public/RAIDStorageArray/workdir/zytan/searchr1_data/nq_hotpotqa_data"
@@ -41,7 +52,7 @@ TOOL_CONFIG_PATH="${PROJECT_ROOT}/recipe/search_r1_verl/tools/search_tool_config
 WAND_PROJECT="Search-R1-Verl"
 EXPERIMENT_NAME="search-r1-grpo-qwen2.5-1.5b-verl-tool-agent"
 
-# ---- Training Hyperparameters (第一阶段: 小batch验证) ----
+# ---- Training Hyperparameters (正式训练: 完整数据) ----
 TRAIN_BATCH_SIZE=64
 ROLLOUT_N=4              # GRPO group size
 MAX_PROMPT_LENGTH=4096
@@ -54,7 +65,7 @@ LOG_PROB_MICRO_BATCH_SIZE=16
 LR=5e-7
 KL_COEF=0.001
 TOTAL_EPOCHS=15
-TOTAL_STEPS=150
+TOTAL_STEPS=1005  # 20000/64 × 3.2 epochs ≈ 1005
 
 # ---- Run Training ----
 mkdir -p "${PROJECT_ROOT}/logs"
@@ -98,25 +109,25 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.truncation=error \
     data.filter_overlong_prompts=True \
+    +data.shuffle_train_dataloader=True \
     data.train_batch_size=${TRAIN_BATCH_SIZE} \
     data.val_batch_size=64 \
     data.max_prompt_length=${MAX_PROMPT_LENGTH} \
     data.max_response_length=${MAX_RESPONSE_LENGTH} \
-    data.shuffle_train_dataloader=True \
     actor_rollout_ref.model.path="${SFT_MODEL_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.actor.optim.lr=${LR} \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.08 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${TRAIN_BATCH_SIZE} \
-    actor_rollout_ref.actor.ppo_micro_batch_size=${PPO_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.n=${ROLLOUT_N} \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL} \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size=${LOG_PROB_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -129,7 +140,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=hermes \
     actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    actor_rollout_ref.ref.log_prob_micro_batch_size=${LOG_PROB_MICRO_BATCH_SIZE} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=${KL_COEF} \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
@@ -138,11 +149,11 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     reward.custom_reward_function.name=compute_score \
     trainer.critic_warmup=0 \
     trainer.logger=['console','wandb'] \
-    trainer.val_before_train=true \
+    trainer.val_before_train=false \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.save_freq=25 \
-    trainer.test_freq=25 \
+    trainer.save_freq=100 \
+    trainer.test_freq=100 \
     trainer.project_name="${WAND_PROJECT}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     trainer.total_epochs=${TOTAL_EPOCHS} \

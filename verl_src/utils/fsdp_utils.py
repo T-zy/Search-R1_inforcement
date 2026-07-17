@@ -1092,7 +1092,7 @@ def merged_lora_context(actor, backup_adapters=False):
 
 def fsdp2_sharded_save_to_cpu(
     model: torch.nn.Module,
-) -> tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]:
+) -> "tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]":
     """
     Sharded Save: Each process only saves the local DTensor shard from its own GPU to CPU memory.
 
@@ -1134,8 +1134,8 @@ def fsdp2_sharded_save_to_cpu(
 
 def fsdp2_sharded_load_from_cpu(
     model: torch.nn.Module,
-    cpu_sharded_state: dict[str, tuple[torch.Tensor, Optional[DTensorSpec]]],
-    target_spec: DTensorSpec,
+    cpu_sharded_state: "dict[str, tuple[torch.Tensor, Optional[DTensorSpec]]]",
+    target_spec: "DTensorSpec",
 ) -> None:
     """
     Sharded Load: Each process only loads the CPU shard it is responsible for to the GPU,

@@ -121,6 +121,20 @@ class HermesToolParser(ToolParser):
                 name, arguments = function_call["name"], function_call["arguments"]
                 function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
             except Exception as e:
+                # 宽容解析：尝试从文本中提取有效的 JSON 对象
+                try:
+                    # 尝试2：用 regex 找到第一个完整的 JSON 对象 {...}
+                    import re as _re
+                    json_match = _re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', match)
+                    if json_match:
+                        repaired = json_match.group()
+                        function_call = json.loads(repaired)
+                        name, arguments = function_call["name"], function_call["arguments"]
+                        function_calls.append(FunctionCall(name=name, arguments=json.dumps(arguments, ensure_ascii=False)))
+                        logger.warning(f"Lenient parse succeeded for tool call (original error: {e})")
+                        continue
+                except Exception:
+                    pass
                 logger.error(f"Failed to decode tool call: {e}")
 
         # remaing text exclude tool call tokens

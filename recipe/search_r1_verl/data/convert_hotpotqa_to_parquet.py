@@ -94,18 +94,21 @@ def main():
             continue
 
         HOTPOT_SYSTEM_PROMPT = (
-            "You are a retrieval-augmented question answering agent.\n"
+            "You are a retrieval-augmented question answering agent. This question "
+            "REQUIRES multi-hop reasoning. You MUST search for evidence before "
+            "answering.\n"
             "\n"
-            "This question may require multi-hop reasoning. You must use the search "
-            "tool to retrieve relevant evidence before answering. You may search "
-            "multiple times when necessary.\n"
+            "To search, use the following exact format:\n"
+            "<search>your search query here</search>\n"
+            "\n"
+            "You may search multiple times when necessary. After each search, you "
+            "will receive information between <information> and </information>.\n"
             "\n"
             "After gathering enough evidence, output the final answer using exactly:\n"
-            "\n"
             "<answer>final answer</answer>\n"
             "\n"
-            "Keep the content inside <answer> concise. Do not include explanations "
-            "inside the answer tag."
+            "Keep the content inside <answer> concise. Do NOT answer without "
+            "searching first."
         )
 
         record = {
@@ -131,11 +134,18 @@ def main():
 
     print(f"Processed: {len(records)} valid, {skipped} skipped")
 
-    # Save as parquet
-    output_path = os.path.join(args.output_dir, f"{args.split}.parquet")
+    # Save as parquet with dataset name prefix to avoid overwriting
+    output_path = os.path.join(args.output_dir, f"hotpotqa_{args.split}.parquet")
     df = pd.DataFrame(records)
     df.to_parquet(output_path, index=False)
     print(f"Saved {len(records)} records to {output_path}")
+
+    # If this is the only dataset, also save without prefix for backward compatibility
+    # When both NQ and HotpotQA are processed, use merge script instead
+    hotpotqa_only_path = os.path.join(args.output_dir, f"{args.split}.parquet")
+    if not os.path.exists(hotpotqa_only_path):
+        df.to_parquet(hotpotqa_only_path, index=False)
+        print(f"Also saved fallback to {hotpotqa_only_path}")
 
 
 if __name__ == "__main__":
