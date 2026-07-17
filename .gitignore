@@ -23,19 +23,13 @@ env/
 .DS_Store
 Thumbs.db
 
-# Logs and checkpoints (generated at runtime)
-logs/
-verl_checkpoints/
-evaluation_results/
-
 # Environment files
 .env
+
+# Checkpoints (model weights only)
 verl_checkpoints/
-wandb/
-outputs/
-__pycache__/
-*.parquet
-*.log
+
+# ML model files (too large)
 *.msgpack
 *.h5
-wandb_export_*.csv
+*.safetensors
